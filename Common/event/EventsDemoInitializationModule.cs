@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -136,9 +136,13 @@ namespace Foundation.Infrastructure
 
         private EventArgs DeSerialize(byte[] buffer)
         {
+#pragma warning disable SYSLIB0011 // Commerce catalog remote events use BinaryFormatter payloads
             var formatter = new BinaryFormatter();
+#pragma warning restore SYSLIB0011
             var stream = new MemoryStream(buffer);
+#pragma warning disable SYSLIB0011
             return formatter.Deserialize(stream) as EventArgs;
+#pragma warning restore SYSLIB0011
         }
 
     }
