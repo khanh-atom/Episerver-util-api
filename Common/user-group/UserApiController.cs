@@ -36,7 +36,12 @@ namespace Foundation.Custom
             string[] roles = { "Administrators" };
 
             var userList = uiUserProvider.FindUsersByNameAsync(username, 0, 1);
-            var user = await userList.FirstOrDefaultAsync();
+            IUIUser user = null;
+            await foreach (var u in userList)
+            {
+                user = u;
+                break;
+            }
 
             if (user == null)
             {
