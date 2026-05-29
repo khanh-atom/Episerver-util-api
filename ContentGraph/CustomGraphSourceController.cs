@@ -162,7 +162,7 @@ namespace Foundation.Custom.Episerver_util_api.ContentGraph
                 }
 
                 // Configure content type with fields
-                _graphSourceClient.ConfigureContentType<TestSearchResult>()
+                _graphSourceClient.ConfigureContentType<TestSearchResult2>()
                     .Field(x => x.Id, IndexingType.Queryable)
                     .Field(x => x.Title, IndexingType.Searchable)
                     .Field(x => x.Description, IndexingType.Searchable)
@@ -274,7 +274,7 @@ namespace Foundation.Custom.Episerver_util_api.ContentGraph
                 }
 
                 var results = new List<object>();
-                var allItems = new List<TestSearchResult>();
+                var allItems = new List<TestSearchResult2>();
 
                 foreach (var lang in languageList)
                 {
@@ -459,12 +459,12 @@ namespace Foundation.Custom.Episerver_util_api.ContentGraph
         /// <summary>
         /// Repro Step 1: Init client, register languages, save types, index content per locale.
         /// After calling this, wait ~30s for Graph server async processing, then call /repro-locale-bug-verify.
-        /// Sample usage: https://localhost:5009/util-api/custom-graph-source/repro-locale-bug-setup?source=repro01&amp;languages=en,es,fr&amp;itemsPerLang=2
+        /// Sample usage: https://localhost:5009/util-api/custom-graph-source/repro-locale-bug-setup?source=repro01&amp;languages=en,es&amp;itemsPerLang=2
         /// </summary>
         [HttpGet("repro-locale-bug-setup")]
         public async Task<IActionResult> ReproLocaleBugSetup(
             [FromQuery] string source = "repro01",
-            [FromQuery] string languages = "en,es,fr",
+            [FromQuery] string languages = "en,es",
             [FromQuery] int itemsPerLang = 2)
         {
             try
@@ -485,7 +485,7 @@ namespace Foundation.Custom.Episerver_util_api.ContentGraph
                 var client = GraphSourceClient.Create(new Uri(gateway), source, appKey, secret);
 
                 // 2. Configure type + register ALL languages
-                client.ConfigureContentType<TestSearchResult>()
+                client.ConfigureContentType<TestSearchResult2>()
                     .Field(x => x.Id, IndexingType.Queryable)
                     .Field(x => x.Title, IndexingType.Searchable)
                     .Field(x => x.Platform, IndexingType.Queryable)
@@ -500,7 +500,7 @@ namespace Foundation.Custom.Episerver_util_api.ContentGraph
                 var indexResults = new List<object>();
                 foreach (var lang in langs)
                 {
-                    var items = Enumerable.Range(1, itemsPerLang).Select(i => new TestSearchResult
+                    var items = Enumerable.Range(1, itemsPerLang).Select(i => new TestSearchResult2
                     {
                         Id = $"REPRO_{Guid.NewGuid():N}_{lang}",
                         Title = $"Repro item {i} ({lang})",
@@ -613,12 +613,12 @@ namespace Foundation.Custom.Episerver_util_api.ContentGraph
 
         #region Helpers
 
-        private static List<TestSearchResult> GenerateSampleItems(string language, int count, string platform)
+        private static List<TestSearchResult2> GenerateSampleItems(string language, int count, string platform)
         {
-            var items = new List<TestSearchResult>();
+            var items = new List<TestSearchResult2>();
             for (int i = 1; i <= count; i++)
             {
-                items.Add(new TestSearchResult
+                items.Add(new TestSearchResult2
                 {
                     Id = $"{platform}_sample-{Guid.NewGuid():N}_{language}",
                     Title = $"Sample {platform} Item {i} ({language})",
@@ -656,7 +656,7 @@ namespace Foundation.Custom.Episerver_util_api.ContentGraph
     /// Custom object model for Graph Source SDK indexing.
     /// Mirrors the pattern used by customers indexing multi-language custom objects.
     /// </summary>
-    public class TestSearchResult
+    public class TestSearchResult2
     {
         public string Id { get; set; }
         public string Title { get; set; }
