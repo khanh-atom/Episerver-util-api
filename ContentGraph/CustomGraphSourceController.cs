@@ -76,7 +76,8 @@ namespace Foundation.Custom.Episerver_util_api.ContentGraph
                     },
                     BugReplicationUrls = new
                     {
-                        OneClick = "https://localhost:5009/util-api/custom-graph-source/repro-locale-bug?source=repro01&languages=en,es,fr&itemsPerLang=2&waitSeconds=30",
+                        Step1_Setup = "https://localhost:5009/util-api/custom-graph-source/repro-locale-bug-setup?source=repro01&languages=en,es,fr&itemsPerLang=2",
+                        Step2_Verify = "https://localhost:5009/util-api/custom-graph-source/repro-locale-bug-verify?languages=en,es,fr&itemsPerLang=2",
                         Description = "Or run these manually in order to replicate the locale issue: only register 'en' but index content for en,es,fr",
                         Step1 = "https://localhost:5009/util-api/custom-graph-source/init-client?source=test-locale-bug",
                         Step2_OnlyEn = "https://localhost:5009/util-api/custom-graph-source/save-types?languages=en",
@@ -456,17 +457,15 @@ namespace Foundation.Custom.Episerver_util_api.ContentGraph
         }
 
         /// <summary>
-        /// Minimal self-contained repro of Source SDK locale routing bug.
-        /// Single endpoint: init → register languages → save types → index per locale → query per locale → compare.
-        /// Proves: SaveContentAsync("es", items) succeeds silently but content is NOT queryable under locale:es.
-        /// Sample usage: https://localhost:5009/util-api/custom-graph-source/repro-locale-bug?source=repro01&amp;languages=en,es,fr&amp;itemsPerLang=2&amp;waitSeconds=30
+        /// Repro Step 1: Init client, register languages, save types, index content per locale.
+        /// After calling this, wait ~30s for Graph server async processing, then call /repro-locale-bug-verify.
+        /// Sample usage: https://localhost:5009/util-api/custom-graph-source/repro-locale-bug-setup?source=repro01&amp;languages=en,es,fr&amp;itemsPerLang=2
         /// </summary>
-        [HttpGet("repro-locale-bug")]
-        public async Task<IActionResult> ReproLocaleBug(
+        [HttpGet("repro-locale-bug-setup")]
+        public async Task<IActionResult> ReproLocaleBugSetup(
             [FromQuery] string source = "repro01",
             [FromQuery] string languages = "en,es,fr",
-            [FromQuery] int itemsPerLang = 2,
-            [FromQuery] int waitSeconds = 30)
+            [FromQuery] int itemsPerLang = 2)
         {
             try
             {
@@ -474,7 +473,6 @@ namespace Foundation.Custom.Episerver_util_api.ContentGraph
                     ?? _configuration["Optimizely:ContentGraph:AppKey"];
                 var secret = _queryOptions.Value.Secret
                     ?? _configuration["Optimizely:ContentGraph:Secret"];
-                var singleKey = _queryOptions.Value.SingleKey;
                 var gateway = _queryOptions.Value.GatewayAddress ?? "https://cg.optimizely.com";
 
                 if (string.IsNullOrWhiteSpace(appKey) || string.IsNullOrWhiteSpace(secret))
@@ -521,10 +519,38 @@ namespace Foundation.Custom.Episerver_util_api.ContentGraph
                     });
                 }
 
-                // 4. Wait for async processing
-                await Task.Delay(TimeSpan.FromSeconds(waitSeconds));
+                return Ok(new
+                {
+                    Step = "Repro Setup — Init + SaveTypes + Index",
+                    Config = new { Source = source, Gateway = gateway, Languages = langs, ItemsPerLang = itemsPerLang },
+                    SaveTypesResponse = saveTypesResult,
+                    IndexResults = indexResults,
+                    NextStep = $"Wait ~30s, then call: https://localhost:5009/util-api/custom-graph-source/repro-locale-bug-verify?languages={string.Join(",", langs)}&itemsPerLang={itemsPerLang}"
+                });
+            }
+            catch (Exception ex)
+            {
+                return BadRequest($"Exception: {ex.Message}\n{ex.InnerException?.Message}\n{ex.StackTrace}");
+            }
+        }
 
-                // 5. Query each locale
+        /// <summary>
+        /// Repro Step 2: Query each locale and compare results. Call this after /repro-locale-bug-setup + waiting ~30s.
+        /// Sample usage: https://localhost:5009/util-api/custom-graph-source/repro-locale-bug-verify?languages=en,es,fr&amp;itemsPerLang=2
+        /// </summary>
+        [HttpGet("repro-locale-bug-verify")]
+        public async Task<IActionResult> ReproLocaleBugVerify(
+            [FromQuery] string languages = "en,es,fr",
+            [FromQuery] int itemsPerLang = 2)
+        {
+            try
+            {
+                var singleKey = _queryOptions.Value.SingleKey;
+                var gateway = _queryOptions.Value.GatewayAddress ?? "https://cg.optimizely.com";
+
+                var langs = languages.Split(',', StringSplitOptions.RemoveEmptyEntries)
+                    .Select(l => l.Trim().ToLowerInvariant()).Distinct().ToList();
+
                 var authParam = !string.IsNullOrWhiteSpace(singleKey) ? $"?auth={singleKey}" : "";
                 var queryUrl = $"{gateway}/content/v2{authParam}";
                 using var httpClient = new HttpClient();
@@ -562,14 +588,11 @@ namespace Foundation.Custom.Episerver_util_api.ContentGraph
 
                 return Ok(new
                 {
-                    Step = "Repro Locale Bug — Minimal Self-Contained Test",
+                    Step = "Repro Verify — Query each locale",
                     BugDetected = bugDetected,
                     Summary = bugDetected
-                        ? $"BUG CONFIRMED: locale:ALL shows {totalAll} items, but locale-specific queries return 0. Content is silently dropped by the Graph server for non-primary locales."
+                        ? $"BUG CONFIRMED: locale:ALL shows items, but locale-specific queries return 0. Content is silently dropped by the Graph server for non-primary locales."
                         : "No bug detected — all locales return expected counts.",
-                    Config = new { Source = source, Gateway = gateway, Languages = langs, ItemsPerLang = itemsPerLang, WaitSeconds = waitSeconds },
-                    SaveTypesResponse = saveTypesResult,
-                    IndexResults = indexResults,
                     QueryResults = queryResults,
                     RootCause = bugDetected ? new
                     {
