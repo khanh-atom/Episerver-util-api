@@ -504,6 +504,159 @@ namespace Foundation.Custom.EpiserverUtilApi.Commerce.CatalogGroup
             }
         }
 
+        /// <summary>
+        /// Replicate all: Runs the full bug reproduction cycle in a single call.
+        /// Creates catalogs, adds node relation, moves nodes, verifies orphaned relation,
+        /// attempts catalog delete (fails with FK error), then cleans up.
+        /// Sample usage: https://localhost:5009/util-api/custom-node-relation-bug/replicate-all
+        /// </summary>
+        [HttpGet("replicate-all")]
+        public IActionResult ReplicateAll()
+        {
+            var steps = new List<object>();
+            var rootLink = _referenceConverter.GetRootLink();
+
+            try
+            {
+                // ── Step 1: Setup ──
+                var oldCatalogLink = GetOrCreateCatalog(OldCatalogName, rootLink);
+                var newCatalogLink = GetOrCreateCatalog(NewCatalogName, rootLink);
+                var parentNodeLink = GetOrCreateNode(ParentNodeCode, "Parent Category", oldCatalogLink);
+                var childNodeLink = GetOrCreateNode(ChildNodeCode, "Child Category", parentNodeLink);
+                var linkedNodeLink = GetOrCreateNode(LinkedNodeCode, "Linked Category", oldCatalogLink);
+
+                var existingChildren = _relationRepository.GetChildren<NodeRelation>(parentNodeLink).ToList();
+                if (!existingChildren.Any(r => r.Child.CompareToIgnoreWorkID(linkedNodeLink)))
+                {
+                    _relationRepository.UpdateRelation(new NodeRelation
+                    {
+                        Parent = parentNodeLink,
+                        Child = linkedNodeLink,
+                        SortOrder = 100
+                    });
+                }
+
+                var oldCatalogId = GetCatalogIdByName(OldCatalogName);
+                var newCatalogId = GetCatalogIdByName(NewCatalogName);
+
+                steps.Add(new
+                {
+                    step = "1_Setup",
+                    status = "OK",
+                    oldCatalogId,
+                    newCatalogId,
+                    detail = "Created 2 catalogs, 3 nodes, 1 NodeRelation (additional category link)"
+                });
+
+                // ── Step 2: Verify before move ──
+                var beforeDto = _catalogSystem.GetCatalogRelationDto(
+                    oldCatalogId, 0, 0, string.Empty,
+                    new CatalogRelationResponseGroup(CatalogRelationResponseGroup.ResponseGroup.CatalogNode));
+                var beforeRelations = beforeDto.CatalogNodeRelation
+                    .Select(r => new { r.CatalogId, r.ParentNodeId, r.ChildNodeId }).ToList();
+
+                steps.Add(new
+                {
+                    step = "2_BeforeMove",
+                    status = "OK",
+                    catalogNodeRelations = beforeRelations,
+                    detail = "CatalogNodeRelation.CatalogId correctly = " + oldCatalogId
+                });
+
+                // ── Step 3: Move nodes ──
+                var oldCatalog = _contentRepository.GetChildren<CatalogContent>(rootLink)
+                    .First(c => c.Name == OldCatalogName);
+                var newCatalog = _contentRepository.GetChildren<CatalogContent>(rootLink)
+                    .First(c => c.Name == NewCatalogName);
+                var topNodes = _contentRepository.GetChildren<NodeContent>(oldCatalog.ContentLink).ToList();
+
+                foreach (var node in topNodes)
+                {
+                    _contentRepository.Move(node.ContentLink, newCatalog.ContentLink,
+                        AccessLevel.NoAccess, AccessLevel.NoAccess);
+                }
+
+                steps.Add(new
+                {
+                    step = "3_MoveNodes",
+                    status = "OK",
+                    movedCount = topNodes.Count,
+                    detail = "Moved " + topNodes.Count + " top-level nodes from OldCatalog to NewCatalog via IContentRepository.Move()"
+                });
+
+                // ── Step 4: Verify after move — THE BUG ──
+                var afterDto = _catalogSystem.GetCatalogRelationDto(
+                    0, 0, 0, string.Empty,
+                    new CatalogRelationResponseGroup(CatalogRelationResponseGroup.ResponseGroup.CatalogNode));
+                var orphans = afterDto.CatalogNodeRelation
+                    .Where(r => r.CatalogId == oldCatalogId).ToList();
+
+                var bugDetails = new List<object>();
+                foreach (var orphan in orphans)
+                {
+                    var pDto = _catalogSystem.GetCatalogNodeDto(orphan.ParentNodeId);
+                    var cDto = _catalogSystem.GetCatalogNodeDto(orphan.ChildNodeId);
+                    bugDetails.Add(new
+                    {
+                        CatalogNodeRelation_CatalogId = orphan.CatalogId,
+                        ParentNodeId = orphan.ParentNodeId,
+                        ParentNode_ActualCatalogId = pDto.CatalogNode.Count > 0 ? pDto.CatalogNode[0].CatalogId : (int?)null,
+                        ChildNodeId = orphan.ChildNodeId,
+                        ChildNode_ActualCatalogId = cDto.CatalogNode.Count > 0 ? cDto.CatalogNode[0].CatalogId : (int?)null,
+                        isBug = pDto.CatalogNode.Count > 0 && orphan.CatalogId != pDto.CatalogNode[0].CatalogId
+                    });
+                }
+
+                var nodesLeft = _catalogSystem.GetCatalogNodesDto(oldCatalogId).CatalogNode.Count;
+                steps.Add(new
+                {
+                    step = "4_VerifyBug",
+                    status = orphans.Count > 0 ? "BUG_CONFIRMED" : "NO_BUG",
+                    orphanedCount = orphans.Count,
+                    nodesRemainingInOldCatalog = nodesLeft,
+                    bugDetails,
+                    detail = orphans.Count > 0
+                        ? "CatalogNodeRelation.CatalogId still = " + oldCatalogId + " but nodes moved to " + newCatalogId
+                        : "No orphaned relations found"
+                });
+
+                // ── Step 5: Delete catalog — will throw FK_CatalogItemCategory_Catalog ──
+                var catalogToDelete = _contentRepository.GetChildren<CatalogContent>(rootLink)
+                    .FirstOrDefault(c => c.Name == OldCatalogName);
+                if (catalogToDelete != null)
+                {
+                    _contentRepository.Delete(catalogToDelete.ContentLink, true, AccessLevel.NoAccess);
+                }
+
+                // If we reach here, the bug is fixed in this version
+                return Ok(new { message = "Catalog deleted successfully — bug may be fixed in this version", steps });
+            }
+            catch (Exception ex)
+            {
+                // Cleanup on failure
+                try
+                {
+                    foreach (var name in new[] { OldCatalogName, NewCatalogName })
+                    {
+                        var cId = GetCatalogIdByName(name);
+                        if (cId > 0)
+                        {
+                            var dto = _catalogSystem.GetCatalogRelationDto(0, 0, 0, string.Empty,
+                                new CatalogRelationResponseGroup(CatalogRelationResponseGroup.ResponseGroup.CatalogNode));
+                            foreach (var r in dto.CatalogNodeRelation.Where(r => r.CatalogId == cId).ToList()) { r.Delete(); }
+                            _catalogSystem.SaveCatalogRelationDto(dto);
+                        }
+                        var cat = _contentRepository.GetChildren<CatalogContent>(rootLink)
+                            .FirstOrDefault(c => c.Name == name);
+                        if (cat != null) _contentRepository.Delete(cat.ContentLink, true, AccessLevel.NoAccess);
+                    }
+                }
+                catch { /* best effort cleanup */ }
+
+                return BadRequest($"Exception: {ex.Message}\n{ex.InnerException?.Message}\n{ex.StackTrace}");
+            }
+        }
+
         #region Helper Methods
 
         private ContentReference GetOrCreateCatalog(string catalogName, ContentReference rootLink)
