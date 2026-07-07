@@ -1,4 +1,4 @@
-﻿using EPiServer.Find;
+using EPiServer.Find;
 using EPiServer.Find.Api.Querying.Queries;
 using EPiServer.Find.Cms;
 using EPiServer.Find.Cms.SearchProviders;
@@ -151,6 +151,11 @@ namespace Dada.Commerce.SearchProvider
                         result.Metadata.Add("SortKey", catalogName);
                         result.Title = $"{catalogName} \\ {result.Title}"; // Prefix the page title with the catalog name
                   
+                    }
+
+                    if (result.Metadata.TryGetValue("LanguageBranch", out var lang) && !string.IsNullOrEmpty(lang.ToString()))
+                    {
+                        result.Metadata["Id"] = $"{result.Metadata["Id"]}_{lang}";
                     }
 
                     return result;
