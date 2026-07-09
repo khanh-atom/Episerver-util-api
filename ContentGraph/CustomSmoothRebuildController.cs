@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text.Json;
 using EPiServer.DataAbstraction;
 using EPiServer.Scheduler;
@@ -9,6 +10,7 @@ using Optimizely.ContentGraph.Cms.Core.Internal;
 using Optimizely.ContentGraph.Cms.NetCore.Core.Internal;
 using Optimizely.ContentGraph.Cms.NetCore.Models.Internal;
 using Optimizely.ContentGraph.Core;
+using Optimizely.ContentGraph.Core.Api.Responses;
 using static Optimizely.ContentGraph.Cms.NetCore.Models.Internal.SmoothDeployJobState;
 
 namespace Foundation.Custom.Episerver_util_api.ContentGraph
@@ -28,6 +30,7 @@ namespace Foundation.Custom.Episerver_util_api.ContentGraph
         private readonly IClient _client;
         private readonly IOptions<QueryOptions> _queryOptions;
         private readonly ILanguagesResolver _languagesResolver;
+        private readonly IContentTypeIndexer _contentTypeIndexer;
 
         private const string SmoothDeployJobId = "1EAC9A34-F89C-44B4-865F-BCBF7B2ABA95";
         private const string ContentIndexingJobName = "ContentIndexingJob";
@@ -38,7 +41,8 @@ namespace Foundation.Custom.Episerver_util_api.ContentGraph
             IScheduledJobExecutor scheduledJobExecutor,
             IClient client,
             IOptions<QueryOptions> queryOptions,
-            ILanguagesResolver languagesResolver)
+            ILanguagesResolver languagesResolver,
+            IContentTypeIndexer contentTypeIndexer)
         {
             _store = store;
             _scheduledJobRepository = scheduledJobRepository;
@@ -46,6 +50,7 @@ namespace Foundation.Custom.Episerver_util_api.ContentGraph
             _client = client;
             _queryOptions = queryOptions;
             _languagesResolver = languagesResolver;
+            _contentTypeIndexer = contentTypeIndexer;
         }
 
         /// <summary>
@@ -114,6 +119,7 @@ namespace Foundation.Custom.Episerver_util_api.ContentGraph
                         "Step 6: GET /util-api/custom-smooth-rebuild/revert — Revert to old deployment",
                         "Step 7: GET /util-api/custom-smooth-rebuild/abandon — Abandon new slot and revert delta to old",
                         "Step 8: GET /util-api/custom-smooth-rebuild/reset-to-idle — Reset state to IDLE (cleanup)",
+                        "Step 9: GET /util-api/custom-smooth-rebuild/full-pipeline — Run the FULL pipeline end-to-end with detailed logs",
                     },
                     SampleUrls = new[]
                     {
@@ -126,6 +132,7 @@ namespace Foundation.Custom.Episerver_util_api.ContentGraph
                         "https://localhost:5009/util-api/custom-smooth-rebuild/revert",
                         "https://localhost:5009/util-api/custom-smooth-rebuild/abandon",
                         "https://localhost:5009/util-api/custom-smooth-rebuild/reset-to-idle",
+                        "https://localhost:5009/util-api/custom-smooth-rebuild/full-pipeline",
                     }
                 });
             }
@@ -581,6 +588,200 @@ namespace Foundation.Custom.Episerver_util_api.ContentGraph
             {
                 return BadRequest($"Exception: {ex.Message}\n{ex.InnerException?.Message}\n{ex.StackTrace}");
             }
+        }
+
+        /// <summary>
+        /// Step 9: Run the FULL smooth rebuild pipeline end-to-end with detailed troubleshooting logs.
+        /// Replicates the entire SmoothDeployJob.Execute() flow: prerequisites → deploy new slot → content type sync → content sync → wait for status → SYNCDELTA.
+        /// Sample usage: https://localhost:5009/util-api/custom-smooth-rebuild/full-pipeline
+        /// </summary>
+        [HttpGet("full-pipeline")]
+        public async Task<IActionResult> FullPipeline(
+            [FromQuery] int statusCheckRetries = 20,
+            [FromQuery] int statusCheckIntervalMs = 5000)
+        {
+            var pipelineLog = new List<object>();
+            var totalStopwatch = Stopwatch.StartNew();
+
+            try
+            {
+                // ── Sub-step 1: Check prerequisites ──
+                var stepSw = Stopwatch.StartNew();
+                var syncJob = _scheduledJobRepository.List()
+                    .FirstOrDefault(x => x.TypeName.EndsWith(ContentIndexingJobName, StringComparison.Ordinal));
+                var resetAt = _store.LoadResettedAt();
+                var languages = _languagesResolver.GetUsedLanguages()?.ToList() ?? new List<string>();
+
+                if (syncJob == null || syncJob.LastExecution == DateTime.MinValue)
+                {
+                    pipelineLog.Add(new { SubStep = "1-Prerequisites", Status = "FAILED", ElapsedMs = stepSw.ElapsedMilliseconds, Error = "ContentIndexingJob has never been executed. Run 'Optimizely Graph content synchronization job' first.", CodeRef = "SmoothDeployJob.cs line 114" });
+                    return Ok(new { Step = "9 — Full Pipeline", Success = false, PipelineLog = pipelineLog, TotalElapsedMs = totalStopwatch.ElapsedMilliseconds });
+                }
+
+                if (syncJob.LastExecution < resetAt)
+                {
+                    pipelineLog.Add(new { SubStep = "1-Prerequisites", Status = "FAILED", ElapsedMs = stepSw.ElapsedMilliseconds, Error = $"ContentIndexingJob last ran at {syncJob.LastExecution:O} but account was reset at {resetAt:O}. Run sync job after reset.", CodeRef = "SmoothDeployJob.cs line 121" });
+                    return Ok(new { Step = "9 — Full Pipeline", Success = false, PipelineLog = pipelineLog, TotalElapsedMs = totalStopwatch.ElapsedMilliseconds });
+                }
+
+                pipelineLog.Add(new { SubStep = "1-Prerequisites", Status = "PASSED", ElapsedMs = stepSw.ElapsedMilliseconds, SyncJobLastRun = syncJob.LastExecution.ToString("O"), ResetAt = resetAt.ToString("O"), Languages = languages, CodeRef = "SmoothDeployJob.cs lines 111-126" });
+
+                // ── Sub-step 2: Set phase to SYNCINPROGRESS ──
+                stepSw.Restart();
+                var state = _store.LoadJobState();
+                var previousPhase = state.JobPhaseReadable;
+                state.JobPhase = SmoothDeployJobPhases.SYNCINPROGRESS;
+                state.StartedSyncAt = DateTime.UtcNow;
+                state.StartedBy = "util-api-full-pipeline";
+                _store.SaveJobState(state);
+                pipelineLog.Add(new { SubStep = "2-SetPhase", Status = "OK", ElapsedMs = stepSw.ElapsedMilliseconds, PreviousPhase = previousPhase, NewPhase = "SYNCINPROGRESS", StartedSyncAt = state.StartedSyncAt?.ToString("O"), CodeRef = "SmoothRebuildController.cs lines 84-91" });
+
+                // ── Sub-step 3: Deploy new account version (create Green slot) ──
+                stepSw.Restart();
+                var languageParams = string.Join(",", languages.Select(lang => $"\"{lang}\""));
+                var deployQuery = $@"mutation {{ deployNewAccountVersion(languages: [{languageParams}]) }}";
+                var deployQsParams = new Dictionary<string, string> { { "slot", "new" } };
+
+                string deployResponse;
+                try
+                {
+                    deployResponse = await _client.QueryAsync(deployQuery, new { }, customHeaders: new Dictionary<string, string>(), queryStringParams: deployQsParams);
+                }
+                catch (Exception deployEx)
+                {
+                    state.JobPhase = SmoothDeployJobPhases.IDLE;
+                    _store.SaveJobState(state);
+                    pipelineLog.Add(new { SubStep = "3-DeployNewSlot", Status = "EXCEPTION", ElapsedMs = stepSw.ElapsedMilliseconds, Error = deployEx.Message, InnerError = deployEx.InnerException?.Message, StackTrace = deployEx.StackTrace, CodeRef = "SmoothDeployJob.cs line 138, GraphQLService.cs line 29-42" });
+                    return Ok(new { Step = "9 — Full Pipeline", Success = false, FailedAt = "DeployNewSlot", PipelineLog = pipelineLog, TotalElapsedMs = totalStopwatch.ElapsedMilliseconds, FinalState = GetStateSnapshot() });
+                }
+
+                var deployContainsDone = deployResponse?.Contains("\"Done\"") ?? false;
+                if (!deployContainsDone)
+                {
+                    state.JobPhase = SmoothDeployJobPhases.IDLE;
+                    _store.SaveJobState(state);
+                    pipelineLog.Add(new { SubStep = "3-DeployNewSlot", Status = "FAILED", ElapsedMs = stepSw.ElapsedMilliseconds, GraphQLMutation = deployQuery, RawResponse = TryParseJson(deployResponse), Error = "Response did not contain '\"Done\"'. Possible 409 Conflict (another operation in progress) or environment does not support slot creation.", CodeRef = "SmoothDeployJob.cs line 140-144" });
+                    return Ok(new { Step = "9 — Full Pipeline", Success = false, FailedAt = "DeployNewSlot", PipelineLog = pipelineLog, TotalElapsedMs = totalStopwatch.ElapsedMilliseconds, FinalState = GetStateSnapshot() });
+                }
+
+                pipelineLog.Add(new { SubStep = "3-DeployNewSlot", Status = "OK", ElapsedMs = stepSw.ElapsedMilliseconds, GraphQLMutation = deployQuery, RawResponse = TryParseJson(deployResponse), CodeRef = "SmoothDeployJob.cs line 138" });
+
+                // ── Sub-step 4: Content type indexing ──
+                stepSw.Restart();
+                Response contentTypeResult;
+                try
+                {
+                    contentTypeResult = await _contentTypeIndexer.IndexAsync();
+                }
+                catch (Exception ctEx)
+                {
+                    pipelineLog.Add(new { SubStep = "4-ContentTypeIndex", Status = "EXCEPTION", ElapsedMs = stepSw.ElapsedMilliseconds, Error = ctEx.Message, InnerError = ctEx.InnerException?.Message, StackTrace = ctEx.StackTrace, CodeRef = "SmoothDeployJob.cs line 227" });
+                    return Ok(new { Step = "9 — Full Pipeline", Success = false, FailedAt = "ContentTypeIndex", PipelineLog = pipelineLog, TotalElapsedMs = totalStopwatch.ElapsedMilliseconds, FinalState = GetStateSnapshot() });
+                }
+
+                if (contentTypeResult?.Result == Result.Error)
+                {
+                    pipelineLog.Add(new { SubStep = "4-ContentTypeIndex", Status = "FAILED", ElapsedMs = stepSw.ElapsedMilliseconds, ErrorMessage = contentTypeResult.Error?.Message, ErrorStatus = contentTypeResult.Error?.Status, CodeRef = "SmoothDeployJob.cs line 229-233" });
+                    return Ok(new { Step = "9 — Full Pipeline", Success = false, FailedAt = "ContentTypeIndex", PipelineLog = pipelineLog, TotalElapsedMs = totalStopwatch.ElapsedMilliseconds, FinalState = GetStateSnapshot() });
+                }
+
+                pipelineLog.Add(new { SubStep = "4-ContentTypeIndex", Status = "OK", ElapsedMs = stepSw.ElapsedMilliseconds, ResultType = contentTypeResult?.Result.ToString(), CodeRef = "SmoothDeployJob.cs line 227" });
+
+                // ── Sub-step 5: Execute the Smooth Rebuild scheduled job ──
+                // This triggers the full SmoothDeployJob.Execute() which handles:
+                //   - Content type indexing (line 227)
+                //   - Content indexing via SmoothDeployJobService.Start() (line 238-241)
+                //   - Sending indexing job result (line 243)
+                //   - Waiting for indexing status (line 266-274)
+                //   - Transitioning to SYNCDELTA (line 165-168)
+                stepSw.Restart();
+                var smoothJob = _scheduledJobRepository.Get(Guid.Parse(SmoothDeployJobId));
+                if (smoothJob == null)
+                {
+                    pipelineLog.Add(new { SubStep = "5-RunScheduledJob", Status = "FAILED", ElapsedMs = stepSw.ElapsedMilliseconds, Error = "Smooth Rebuild scheduled job not found in repository.", CodeRef = "SmoothRebuildController.cs line 82" });
+                    return Ok(new { Step = "9 — Full Pipeline", Success = false, FailedAt = "RunScheduledJob", PipelineLog = pipelineLog, TotalElapsedMs = totalStopwatch.ElapsedMilliseconds, FinalState = GetStateSnapshot() });
+                }
+
+                dynamic jobResult;
+                try
+                {
+                    jobResult = await _scheduledJobExecutor.StartAsync(smoothJob);
+                }
+                catch (Exception jobEx)
+                {
+                    pipelineLog.Add(new { SubStep = "5-RunScheduledJob", Status = "EXCEPTION", ElapsedMs = stepSw.ElapsedMilliseconds, Error = jobEx.Message, InnerError = jobEx.InnerException?.Message, StackTrace = jobEx.StackTrace, CodeRef = "SmoothDeployJob.Execute() full flow" });
+                    return Ok(new { Step = "9 — Full Pipeline", Success = false, FailedAt = "RunScheduledJob", PipelineLog = pipelineLog, TotalElapsedMs = totalStopwatch.ElapsedMilliseconds, FinalState = GetStateSnapshot() });
+                }
+
+                var jobStatus = jobResult?.Status?.ToString() ?? "Unknown";
+                var jobMessage = (string)(jobResult?.Message ?? "");
+                var jobSucceeded = jobStatus.Contains("Succeeded", StringComparison.OrdinalIgnoreCase) || jobStatus == "0";
+                var postJobState = _store.LoadJobState();
+
+                pipelineLog.Add(new
+                {
+                    SubStep = "5-RunScheduledJob",
+                    Status = jobSucceeded ? "OK" : "FAILED",
+                    ElapsedMs = stepSw.ElapsedMilliseconds,
+                    JobExecutionStatus = jobStatus,
+                    JobMessage = jobMessage,
+                    PostJobPhase = postJobState.JobPhaseReadable,
+                    ItemsToSync = postJobState.ItemsToSync,
+                    ItemsSynced = postJobState.ItemsSynced,
+                    LastError = postJobState.LastError,
+                    CodeRef = "SmoothDeployJob.Execute() — runs content type sync, content sync, sends journal, waits for status, transitions to SYNCDELTA"
+                });
+
+                if (!jobSucceeded)
+                {
+                    return Ok(new { Step = "9 — Full Pipeline", Success = false, FailedAt = "RunScheduledJob", PipelineLog = pipelineLog, TotalElapsedMs = totalStopwatch.ElapsedMilliseconds, FinalState = GetStateSnapshot() });
+                }
+
+                // ── Sub-step 6: Read final state (job handles SYNCDELTA transition internally) ──
+                stepSw.Restart();
+                var finalState = _store.LoadJobState();
+                pipelineLog.Add(new { SubStep = "6-FinalState", Status = "OK", ElapsedMs = stepSw.ElapsedMilliseconds, FinalPhase = finalState.JobPhaseReadable, ItemsToSync = finalState.ItemsToSync, ItemsSynced = finalState.ItemsSynced, StartedDeltaSyncAt = finalState.StartedDeltaSyncAt?.ToString("O"), CodeRef = "SmoothDeployJob.cs lines 165-168 (phase transition happens inside Execute())" });
+
+                totalStopwatch.Stop();
+                return Ok(new
+                {
+                    Step = "9 — Full Pipeline",
+                    Success = true,
+                    TotalElapsedMs = totalStopwatch.ElapsedMilliseconds,
+                    TotalElapsedFormatted = $"{totalStopwatch.Elapsed.TotalSeconds:F1}s",
+                    FinalPhase = finalState.JobPhaseReadable,
+                    Summary = finalState.JobPhase == SmoothDeployJobPhases.SYNCDELTA
+                        ? "Full pipeline completed. The new Green slot is synced and ready. You can now Accept (swap to live) or Abandon (discard)."
+                        : $"Pipeline completed but final phase is {finalState.JobPhaseReadable} (expected SYNCDELTA). Check the pipeline log for details.",
+                    NextSteps = new
+                    {
+                        Accept = "https://localhost:5009/util-api/custom-smooth-rebuild/accept",
+                        Abandon = "https://localhost:5009/util-api/custom-smooth-rebuild/abandon",
+                        CheckState = "https://localhost:5009/util-api/custom-smooth-rebuild/get-state"
+                    },
+                    PipelineLog = pipelineLog,
+                    FinalState = GetStateSnapshot()
+                });
+            }
+            catch (Exception ex)
+            {
+                return BadRequest($"Exception: {ex.Message}\n{ex.InnerException?.Message}\n{ex.StackTrace}");
+            }
+        }
+
+        private object GetStateSnapshot()
+        {
+            var s = _store.LoadJobState();
+            return new
+            {
+                Phase = s.JobPhaseReadable,
+                s.HasActiveSlot,
+                s.StartedSyncAt,
+                s.StartedDeltaSyncAt,
+                s.ItemsToSync,
+                s.ItemsSynced,
+                s.LastError
+            };
         }
 
         #region Helpers
